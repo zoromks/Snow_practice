@@ -1,0 +1,49 @@
+CREATE OR REPLACE SECRET github_secret
+TYPE = PASSWORD
+USERNAME = 'zoromks'
+PASSWORD = 'Mohans@0123';
+
+
+CREATE OR REPLACE API INTEGRATION git_api
+API_PROVIDER = git_https_api
+API_ALLOWED_PREFIXES = ('https://github.com')
+ENABLED = TRUE;
+
+
+CREATE OR REPLACE API INTEGRATION git_api
+API_PROVIDER = git_https_api
+API_ALLOWED_PREFIXES = ('https://github.com')
+ALLOWED_AUTHENTICATION_SECRETS = (github_secret)
+ENABLED = TRUE;
+
+
+CREATE OR REPLACE GIT REPOSITORY snow_pract
+API_INTEGRATION = git_api
+ORIGIN = 'https://github.com/zoromks/Snow_practice.git'
+GIT_CREDENTIALS = github_secret;
+
+
+ALTER GIT REPOSITORY snow_pract FETCH; --Git Repository SNOW_PRACT is up to date. No change was fetched.
+
+SHOW GIT BRANCHES IN Snow_pract;
+
+LS @Snow_pract/branches/main;
+
+EXECUTE IMMEDIATE
+FROM @snow_pract/branches/main/main/tables/sample.sql;
+
+
+commit;
+
+MKSNOW.PUBLIC.SNOW_PRACT
+
+
+create table mk(id int);
+
+
+select * from mk;
+
+
+
+
+

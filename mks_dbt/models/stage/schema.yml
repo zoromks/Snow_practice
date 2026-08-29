@@ -1,0 +1,22 @@
+version: 2 
+models: 
+  - name: stg_cust
+    columns: 
+      - name: customer_id 
+        tests: [not_null, unique] 
+      - name: email 
+        tests: [not_null] 
+ 
+  - name: stg_orders 
+    columns: 
+      - name: order_id 
+        tests: [not_null, unique] 
+      - name: status 
+        tests: 
+          - accepted_values: 
+              values: ['pending','shipped','delivered','cancelled'] 
+      - name: customer_id 
+        tests: 
+          - relationships: 
+              to: ref('stg_cust') 
+              field: customer_id

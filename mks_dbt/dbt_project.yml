@@ -1,0 +1,19 @@
+name: mks_dbt
+version: 1.0.0
+config-version: 2
+profile: mks_dbt
+model-paths:
+  - models
+analysis-paths:
+  - analyses
+test-paths:
+  - tests
+seed-paths:
+  - seeds
+macro-paths:
+  - macros
+snapshot-paths:
+  - snapshots
+models:
+  mks_dbt:
+    +materialized: view

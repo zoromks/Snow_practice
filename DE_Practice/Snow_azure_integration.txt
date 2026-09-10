@@ -1,0 +1,64 @@
+creating storage integration and stage from azure to snowflake:
+
+
+CREATE OR REPLACE STORAGE INTEGRATION azure_int
+TYPE = EXTERNAL_STAGE
+STORAGE_PROVIDER = 'AZURE'
+ENABLED = TRUE
+AZURE_TENANT_ID = 'bb0cf065-408e-478a-833a-8cdd5b835175'
+STORAGE_ALLOWED_LOCATIONS = (
+'azure://blobmks.blob.core.windows.net/blob1/'
+);
+
+
+CREATE OR REPLACE FILE FORMAT csv_ff
+TYPE = CSV
+FIELD_DELIMITER = ','
+SKIP_HEADER = 1
+FIELD_OPTIONALLY_ENCLOSED_BY = '"';
+
+
+
+CREATE OR REPLACE STAGE adf_stage
+URL='azure://blobmks.blob.core.windows.net/blob1/'
+STORAGE_INTEGRATION = azure_int
+FILE_FORMAT = csv_ff;
+
+
+list @adf_stage;
+
+
+
+desc storage integration azure_int;
+ in this check
+
+AZURE_CONSENT_URL --approve
+AZURE_MULTI_TENANT_APP_NAME --copy name and assign member in azure blob (IAM)
+Select the Role
+
+For read access (most common):
+
+Storage Blob Data Reader
+
+For read and write access:
+
+Storage Blob Data Contributor
+
+Click + Select members.
+
+Search for the value of AZURE_MULTI_TENANT_APP_NAME (for example, Snowflake_ABC123XYZ).
+
+Select it and click Review + Assign.
+
+if u dont get name in members
+
+In the Azure portal:
+
+Microsoft Entra ID → Enterprise applications
+
+Search for the value of AZURE_MULTI_TENANT_APP_NAME.
+
+copy the name and assign role in (IAM)
+
+
+

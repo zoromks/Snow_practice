@@ -1,0 +1,1222 @@
+-- ============================================================
+-- STEP 1: Create the project database and layered schemas
+-- ============================================================
+USE ROLE SYSADMIN;
+
+CREATE DATABASE IF NOT EXISTS RETAILMART_DW
+  COMMENT = 'RetailMart Global Data Warehouse - Practice Project';
+
+-- Bronze / Silver / Gold / Reporting layers
+CREATE SCHEMA IF NOT EXISTS RETAILMART_DW.RAW
+  COMMENT = 'Bronze: raw untransformed source data';
+CREATE SCHEMA IF NOT EXISTS RETAILMART_DW.STAGING
+  COMMENT = 'Silver: cleansed and validated data';
+CREATE SCHEMA IF NOT EXISTS RETAILMART_DW.ANALYTICS
+  COMMENT = 'Gold: star schema fact and dimension tables';
+CREATE SCHEMA IF NOT EXISTS RETAILMART_DW.REPORTING
+  COMMENT = 'Aggregated views for BI tools';
+CREATE SCHEMA IF NOT EXISTS RETAILMART_DW.CONTROL
+  COMMENT = 'ETL control tables: watermarks, audit logs';
+
+
+-- ============================================================
+-- STEP 2: Create purpose-specific warehouses
+-- ============================================================
+USE ROLE SYSADMIN;
+
+-- Ingestion warehouse (used for COPY INTO, Snowpipe)
+CREATE WAREHOUSE IF NOT EXISTS INGEST_WH
+  WAREHOUSE_SIZE = 'SMALL'
+  AUTO_SUSPEND = 15
+  AUTO_RESUME = TRUE
+  COMMENT = 'Used for data loading and ingestion';
+
+
+desc warehouse INGEST_WH;
+
+-- Transformation warehouse (heavy ETL, dbt, Streams+Tasks)
+CREATE WAREHOUSE IF NOT EXISTS TRANSFORM_WH
+  WAREHOUSE_SIZE = 'MEDIUM'
+  AUTO_SUSPEND = 15
+  AUTO_RESUME = TRUE
+  COMMENT = 'Heavy transformation and pipeline processing';
+
+-- Analytics / BI warehouse (dashboards, ad-hoc queries)
+CREATE WAREHOUSE IF NOT EXISTS ANALYTICS_WH
+  WAREHOUSE_SIZE = 'SMALL'
+  AUTO_SUSPEND = 15
+  AUTO_RESUME = TRUE
+  INITIALLY_SUSPENDED = TRUE
+  COMMENT = 'Analyst queries and BI tool connections';
+
+-- High-concurrency warehouse for multi-user dashboards
+CREATE WAREHOUSE IF NOT EXISTS BI_WH
+  WAREHOUSE_SIZE = 'SMALL'
+  AUTO_SUSPEND = 15
+  AUTO_RESUME = TRUE
+  COMMENT = 'Multi-cluster for concurrent BI users';
+
+
+
+-- ============================================================
+-- STEP 3: Create custom roles for each team
+-- ============================================================
+USE ROLE SECURITYADMIN;
+
+-- Create functional roles
+CREATE ROLE IF NOT EXISTS DE_ENGINEER_ROLE   COMMENT = 'Data Engineers: full ETL access';
+CREATE ROLE IF NOT EXISTS DA_ANALYST_ROLE    COMMENT = 'Analysts: read analytics + reporting';
+CREATE ROLE IF NOT EXISTS BI_ROLE            COMMENT = 'BI tools: read reporting schemas only';
+CREATE ROLE IF NOT EXISTS PII_ADMIN_ROLE     COMMENT = 'Can see unmasked PII columns';
+
+-- Grant warehouse access
+GRANT USAGE ON WAREHOUSE TRANSFORM_WH  TO ROLE DE_ENGINEER_ROLE;
+GRANT USAGE ON WAREHOUSE ANALYTICS_WH  TO ROLE DA_ANALYST_ROLE;
+GRANT USAGE ON WAREHOUSE BI_WH         TO ROLE BI_ROLE;
+
+-- Grant database access
+GRANT USAGE ON DATABASE RETAILMART_DW TO ROLE DE_ENGINEER_ROLE;
+GRANT USAGE ON DATABASE RETAILMART_DW TO ROLE DA_ANALYST_ROLE;
+GRANT USAGE ON DATABASE RETAILMART_DW TO ROLE BI_ROLE;
+
+-- Data Engineer: full access to all schemas
+GRANT ALL ON SCHEMA RETAILMART_DW.RAW      TO ROLE DE_ENGINEER_ROLE;
+GRANT ALL ON SCHEMA RETAILMART_DW.STAGING  TO ROLE DE_ENGINEER_ROLE;
+GRANT ALL ON SCHEMA RETAILMART_DW.ANALYTICS TO ROLE DE_ENGINEER_ROLE;
+GRANT ALL ON SCHEMA RETAILMART_DW.REPORTING TO ROLE DE_ENGINEER_ROLE;
+GRANT ALL ON SCHEMA RETAILMART_DW.CONTROL  TO ROLE DE_ENGINEER_ROLE;
+
+-- Analyst: read-only on analytics + reporting
+GRANT USAGE ON SCHEMA RETAILMART_DW.ANALYTICS  TO ROLE DA_ANALYST_ROLE;
+GRANT USAGE ON SCHEMA RETAILMART_DW.REPORTING  TO ROLE DA_ANALYST_ROLE;
+GRANT SELECT ON ALL TABLES IN SCHEMA RETAILMART_DW.ANALYTICS  TO ROLE DA_ANALYST_ROLE;
+GRANT SELECT ON ALL TABLES IN SCHEMA RETAILMART_DW.REPORTING  TO ROLE DA_ANALYST_ROLE;
+-- Future tables inherit access
+GRANT SELECT ON FUTURE TABLES IN SCHEMA RETAILMART_DW.ANALYTICS TO ROLE DA_ANALYST_ROLE;
+GRANT SELECT ON FUTURE TABLES IN SCHEMA RETAILMART_DW.REPORTING TO ROLE DA_ANALYST_ROLE;
+
+-- BI role: reporting schema only
+GRANT USAGE ON SCHEMA RETAILMART_DW.REPORTING TO ROLE BI_ROLE;
+GRANT SELECT ON ALL TABLES IN SCHEMA RETAILMART_DW.REPORTING TO ROLE BI_ROLE;
+
+-- Role hierarchy (inherits child privileges)
+GRANT ROLE DA_ANALYST_ROLE TO ROLE DE_ENGINEER_ROLE;
+GRANT ROLE BI_ROLE         TO ROLE DA_ANALYST_ROLE;
+
+-- Create sample users
+USE ROLE USERADMIN;
+CREATE USER IF NOT EXISTS john_engineer
+  PASSWORD = 'TempPass123!'  DEFAULT_ROLE = DE_ENGINEER_ROLE  MUST_CHANGE_PASSWORD = TRUE;
+CREATE USER IF NOT EXISTS jane_analyst
+  PASSWORD = 'TempPass123!'  DEFAULT_ROLE = DA_ANALYST_ROLE   MUST_CHANGE_PASSWORD = TRUE;
+GRANT ROLE DE_ENGINEER_ROLE TO USER john_engineer;
+GRANT ROLE DA_ANALYST_ROLE  TO USER jane_analyst;
+
+grant role DE_ENGINEER_ROLE to user mohanks;
+
+
+
+
+select current_user();
+
+-- ============================================================
+-- RAW LAYER: accept data as-is from source systems
+-- ============================================================
+USE ROLE DE_ENGINEER_ROLE;
+USE DATABASE RETAILMART_DW;
+USE SCHEMA RAW;
+
+-- Raw customers (source: CRM system)
+CREATE OR REPLACE TABLE raw_customers (
+  load_id         NUMBER AUTOINCREMENT PRIMARY KEY,
+  customer_id     VARCHAR(20),
+  full_name       VARCHAR(200),
+  email           VARCHAR(255),
+  phone           VARCHAR(30),
+  address         VARCHAR(500),
+  city            VARCHAR(100),
+  state           VARCHAR(50),
+  country         VARCHAR(50),
+  postal_code     VARCHAR(20),
+  date_of_birth   VARCHAR(20),       -- raw: may be malformed
+  gender          VARCHAR(10),
+  loyalty_tier    VARCHAR(20),
+  signup_date     VARCHAR(30),       -- raw: string
+  is_active       VARCHAR(5),        -- raw: 'Y'/'N'/'true'/'false'
+  raw_json        VARIANT,           -- full source JSON for reference
+  _load_ts        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  _source_file    VARCHAR(500)
+);
+
+-- Raw products (source: Product catalog API)
+CREATE OR REPLACE TABLE raw_products (
+  load_id         NUMBER AUTOINCREMENT PRIMARY KEY,
+  product_id      VARCHAR(20),
+  sku             VARCHAR(50),
+  product_name    VARCHAR(500),
+  category        VARCHAR(100),
+  sub_category    VARCHAR(100),
+  brand           VARCHAR(100),
+  unit_price      VARCHAR(20),       -- raw: may include '$' symbol
+  cost_price      VARCHAR(20),
+  weight_kg       VARCHAR(20),
+  stock_qty       VARCHAR(20),
+  supplier_id     VARCHAR(20),
+  country_of_origin VARCHAR(50),
+  tags            VARIANT,           -- JSON array of tags
+  attributes      VARIANT,           -- JSON object of specs
+  _load_ts        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  _source_file    VARCHAR(500)
+);
+
+-- Raw orders (source: Transactional DB)
+CREATE OR REPLACE TABLE raw_orders (
+  load_id         NUMBER AUTOINCREMENT PRIMARY KEY,
+  order_id        VARCHAR(30),
+  customer_id     VARCHAR(20),
+  order_date      VARCHAR(30),
+  status          VARCHAR(30),
+  channel         VARCHAR(30),       -- 'web','mobile','store','marketplace'
+  region          VARCHAR(50),
+  currency        VARCHAR(5),
+  subtotal        VARCHAR(20),
+  discount_amt    VARCHAR(20),
+  tax_amt         VARCHAR(20),
+  shipping_amt    VARCHAR(20),
+  total_amt       VARCHAR(20),
+  payment_method  VARCHAR(30),
+  promo_code      VARCHAR(30),
+  notes           VARCHAR(1000),
+  line_items      VARIANT,           -- JSON array of order items
+  _load_ts        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  _source_file    VARCHAR(500)
+);
+
+-- Raw clickstream events (source: Web analytics)
+CREATE OR REPLACE TABLE raw_events (
+  load_id         NUMBER AUTOINCREMENT PRIMARY KEY,
+  event_id        VARCHAR(40),
+  session_id      VARCHAR(40),
+  user_id         VARCHAR(20),
+  event_type      VARCHAR(50),  -- page_view, add_to_cart, purchase, search
+  event_payload   VARIANT,      -- full JSON event body
+  event_ts        TIMESTAMP,
+  _load_ts        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
+
+-- Dimension: Date (pre-populated, never changes)
+CREATE OR REPLACE TABLE dim_date (
+  date_key        NUMBER PRIMARY KEY,   -- YYYYMMDD format
+  full_date       DATE,
+  year            NUMBER(4),
+  quarter         NUMBER(1),
+  month           NUMBER(2),
+  month_name      VARCHAR(10),
+  week_of_year    NUMBER(2),
+  day_of_week     NUMBER(1),
+  day_name        VARCHAR(10),
+  day_of_month    NUMBER(2),
+  is_weekend      BOOLEAN,
+  is_holiday      BOOLEAN DEFAULT FALSE,
+  fiscal_year     NUMBER(4),
+  fiscal_quarter  NUMBER(1)
+);
+
+-- Dimension: Customer (SCD Type 2)
+CREATE OR REPLACE TABLE dim_customer (
+  customer_sk     NUMBER AUTOINCREMENT PRIMARY KEY,  -- surrogate key
+  customer_id     VARCHAR(20)  NOT NULL,             -- business key
+  full_name       VARCHAR(200),
+  email           VARCHAR(255),
+  phone           VARCHAR(30),
+  city            VARCHAR(100),
+  state           VARCHAR(50),
+  country         VARCHAR(50),
+  postal_code     VARCHAR(20),
+  date_of_birth   DATE,
+  gender          VARCHAR(10),
+  loyalty_tier    VARCHAR(20),  -- BRONZE/SILVER/GOLD/PLATINUM
+  age_group       VARCHAR(20),  -- 18-24, 25-34, 35-44, 45-54, 55+
+  signup_date     DATE,
+  is_active       BOOLEAN,
+  -- SCD Type 2 columns
+  effective_from  DATE,
+  effective_to    DATE,
+  is_current      BOOLEAN DEFAULT TRUE,
+  -- Audit
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Dimension: Product
+CREATE OR REPLACE TABLE dim_product (
+  product_sk      NUMBER AUTOINCREMENT PRIMARY KEY,
+  product_id      VARCHAR(20)  NOT NULL,
+  sku             VARCHAR(50),
+  product_name    VARCHAR(500),
+  category        VARCHAR(100),
+  sub_category    VARCHAR(100),
+  brand           VARCHAR(100),
+  unit_price      NUMBER(12,2),
+  cost_price      NUMBER(12,2),
+  gross_margin_pct NUMBER(5,2),
+  weight_kg       NUMBER(8,3),
+  supplier_id     VARCHAR(20),
+  country_of_origin VARCHAR(50),
+  is_active       BOOLEAN DEFAULT TRUE,
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Fact: Orders (grain = one order line item)
+CREATE OR REPLACE TABLE fact_orders (
+  order_sk        NUMBER AUTOINCREMENT PRIMARY KEY,
+  order_id        VARCHAR(30)  NOT NULL,
+  order_line_num  NUMBER(3)    NOT NULL,
+  -- Foreign keys to dimensions
+  date_key        NUMBER       REFERENCES dim_date(date_key),
+  customer_sk     NUMBER       REFERENCES dim_customer(customer_sk),
+  product_sk      NUMBER       REFERENCES dim_product(product_sk),
+  -- Degenerate dimensions
+  status          VARCHAR(30),
+  channel         VARCHAR(30),
+  region          VARCHAR(50),
+  payment_method  VARCHAR(30),
+  promo_code      VARCHAR(30),
+  -- Measures
+  quantity        NUMBER(6),
+  unit_price      NUMBER(12,2),
+  line_subtotal   NUMBER(14,2),
+  discount_amt    NUMBER(12,2),
+  tax_amt         NUMBER(12,2),
+  shipping_amt    NUMBER(12,2),
+  line_total      NUMBER(14,2),
+  cost_total      NUMBER(14,2),
+  gross_profit    NUMBER(14,2),
+  -- Audit
+  loaded_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Control table: ETL watermarks
+USE SCHEMA CONTROL;
+CREATE OR REPLACE TABLE etl_watermark (
+  table_name      VARCHAR(200) PRIMARY KEY,
+  last_loaded_ts  TIMESTAMP,
+  last_run_status VARCHAR(20),
+  rows_processed  NUMBER,
+  updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Control table: Audit log
+CREATE OR REPLACE TABLE etl_audit_log (
+  log_id          NUMBER AUTOINCREMENT PRIMARY KEY,
+  pipeline_name   VARCHAR(200),
+  run_id          VARCHAR(100),
+  start_time      TIMESTAMP,
+  end_time        TIMESTAMP,
+  status          VARCHAR(20),  -- SUCCESS/FAILED/RUNNING
+  rows_inserted   NUMBER DEFAULT 0,
+  rows_updated    NUMBER DEFAULT 0,
+  rows_deleted    NUMBER DEFAULT 0,
+  error_message   VARCHAR(2000),
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+--data ingestion
+
+
+
+USE SCHEMA RETAILMART_DW.ANALYTICS;
+
+-- Generate date dimension for 2022-01-01 to 2025-12-31
+INSERT INTO dim_date
+WITH date_spine AS (
+  SELECT DATEADD(DAY, SEQ4(), '2022-01-01'::DATE) AS dt
+  FROM TABLE(GENERATOR(ROWCOUNT => 1461))  -- 4 years
+)
+SELECT
+  TO_NUMBER(TO_CHAR(dt, 'YYYYMMDD'))        AS date_key,
+  dt                                         AS full_date,
+  YEAR(dt)                                   AS year,
+  QUARTER(dt)                                AS quarter,
+  MONTH(dt)                                  AS month,
+  TO_CHAR(dt, 'MMMM')                        AS month_name,
+  WEEKOFYEAR(dt)                             AS week_of_year,
+  DAYOFWEEK(dt)                              AS day_of_week,
+  DAYNAME(dt)                                AS day_name,
+  DAYOFMONTH(dt)                             AS day_of_month,
+  CASE WHEN DAYOFWEEK(dt) IN (1,7) THEN TRUE ELSE FALSE END AS is_weekend,
+  FALSE                                      AS is_holiday,
+  CASE WHEN MONTH(dt) >= 4 THEN YEAR(dt) ELSE YEAR(dt)-1 END AS fiscal_year,
+  CASE
+    WHEN MONTH(dt) IN (4,5,6)   THEN 1
+    WHEN MONTH(dt) IN (7,8,9)   THEN 2
+    WHEN MONTH(dt) IN (10,11,12) THEN 3
+    ELSE 4
+  END                                        AS fiscal_quarter
+FROM date_spine;
+
+-- Mark major US holidays
+UPDATE dim_date SET is_holiday = TRUE
+WHERE full_date IN (
+  '2022-01-01','2022-07-04','2022-11-24','2022-12-25',
+  '2023-01-01','2023-07-04','2023-11-23','2023-12-25',
+  '2024-01-01','2024-07-04','2024-11-28','2024-12-25',
+  '2025-01-01','2025-07-04','2025-11-27','2025-12-25'
+);
+
+SELECT COUNT(*) AS total_dates FROM dim_date;  -- should be 1461
+
+3.2 Sample Customer Data (50 customers);
+
+USE SCHEMA RETAILMART_DW.RAW;
+
+INSERT INTO raw_customers
+  (customer_id, full_name, email, phone, city, state, country, postal_code,
+   date_of_birth, gender, loyalty_tier, signup_date, is_active)
+VALUES
+  ('C001','Alice Johnson','alice.j@email.com','555-0101','New York','NY','USA','10001','1988-03-15','F','GOLD','2021-01-10','Y'),
+  ('C002','Bob Martinez','bob.m@email.com','555-0102','Los Angeles','CA','USA','90001','1975-07-22','M','PLATINUM','2020-05-15','Y'),
+  ('C003','Carol Smith','carol.s@email.com','555-0103','Chicago','IL','USA','60601','1992-11-08','F','SILVER','2022-02-28','Y'),
+  ('C004','David Lee','david.l@email.com','555-0104','Houston','TX','USA','77001','1985-04-30','M','BRONZE','2022-08-14','Y'),
+  ('C005','Emma Wilson','emma.w@email.com','555-0105','Phoenix','AZ','USA','85001','1998-09-12','F','GOLD','2021-11-20','Y'),
+  ('C006','Frank Chen','frank.c@email.com','555-0106','Philadelphia','PA','USA','19101','1980-02-14','M','SILVER','2022-03-05','Y'),
+  ('C007','Grace Kim','grace.k@email.com','555-0107','San Antonio','TX','USA','78201','1993-06-25','F','BRONZE','2023-01-18','Y'),
+  ('C008','Henry Brown','henry.b@email.com','555-0108','San Diego','CA','USA','92101','1970-12-03','M','PLATINUM','2019-07-22','Y'),
+  ('C009','Isabella Davis','isabella.d@email.com','555-0109','Dallas','TX','USA','75201','1995-08-17','F','GOLD','2021-04-30','Y'),
+  ('C010','James Miller','james.m@email.com','555-0110','San Jose','CA','USA','95101','1987-01-28','M','SILVER','2022-06-12','Y'),
+  ('C011','Katherine Moore','kath.m@email.com','555-0111','Austin','TX','USA','73301','1990-05-19','F','BRONZE','2023-03-07','Y'),
+  ('C012','Liam Taylor','liam.t@email.com','555-0112','Jacksonville','FL','USA','32201','1983-10-11','M','GOLD','2020-09-14','Y'),
+  ('C013','Mia Anderson','mia.a@email.com','555-0113','Fort Worth','TX','USA','76101','1997-03-02','F','SILVER','2022-11-25','Y'),
+  ('C014','Noah Thomas','noah.t@email.com','555-0114','Columbus','OH','USA','43201','1991-07-14','M','BRONZE','2023-05-09','Y'),
+  ('C015','Olivia Jackson','olivia.j@email.com','555-0115','Charlotte','NC','USA','28201','1986-12-20','F','PLATINUM','2020-02-28','Y'),
+  ('C016','Paul Harris','paul.h@email.com','555-0116','Indianapolis','IN','USA','46201','1978-04-06','M','GOLD','2021-08-03','Y'),
+  ('C017','Quinn Martin','quinn.m@email.com','555-0117','San Francisco','CA','USA','94101','1994-09-28','F','SILVER','2022-07-16','Y'),
+  ('C018','Ryan Thompson','ryan.t@email.com','555-0118','Seattle','WA','USA','98101','1989-02-15','M','BRONZE','2023-02-11','Y'),
+  ('C019','Sophia Garcia','sophia.g@email.com','555-0119','Denver','CO','USA','80201','1996-06-07','F','GOLD','2021-05-24','Y'),
+  ('C020','Tyler White','tyler.w@email.com','555-0120','Nashville','TN','USA','37201','1982-11-30','M','SILVER','2022-04-19','Y'),
+  ('C021','Uma Patel','uma.p@email.com','555-0121','Las Vegas','NV','USA','89101','1993-08-22','F','BRONZE','2023-06-14','Y'),
+  ('C022','Victor Robinson','victor.r@email.com','555-0122','Portland','OR','USA','97201','1976-03-10','M','PLATINUM','2019-12-05','Y'),
+  ('C023','Wendy Clark','wendy.c@email.com','555-0123','Memphis','TN','USA','38101','1988-07-03','F','GOLD','2021-03-17','Y'),
+  ('C024','Xavier Lewis','xavier.l@email.com','555-0124','Louisville','KY','USA','40201','1995-01-25','M','SILVER','2022-09-08','Y'),
+  ('C025','Yasmine Walker','yas.w@email.com','555-0125','Baltimore','MD','USA','21201','1984-05-16','F','BRONZE','2023-04-22','Y'),
+  ('C026','Zoe Hall','zoe.h@email.com','555-0126','Milwaukee','WI','USA','53201','1999-10-08','F','GOLD','2022-01-30','Y'),
+  ('C027','Aaron Allen','aaron.a@email.com','555-0127','Albuquerque','NM','USA','87101','1981-04-12','M','SILVER','2022-05-14','Y'),
+  ('C028','Bella Young','bella.y@email.com','555-0128','Tucson','AZ','USA','85701','1992-08-27','F','BRONZE','2023-07-18','Y'),
+  ('C029','Carlos Hernandez','carlos.h@email.com','555-0129','Fresno','CA','USA','93701','1979-02-19','M','PLATINUM','2020-11-09','Y'),
+  ('C030','Diana King','diana.k@email.com','555-0130','Sacramento','CA','USA','95801','1996-12-04','F','GOLD','2021-07-26','Y'),
+  ('C031','Ethan Wright','ethan.w@email.com','555-0131','Long Beach','CA','USA','90801','1988-06-13','M','SILVER','2022-10-03','Y'),
+  ('C032','Fiona Lopez','fiona.l@email.com','555-0132','Kansas City','MO','USA','64101','1994-03-29','F','BRONZE','2023-08-25','Y'),
+  ('C033','George Hill','george.h@email.com','555-0133','Mesa','AZ','USA','85201','1977-09-15','M','GOLD','2021-02-12','Y'),
+  ('C034','Hannah Scott','hannah.s@email.com','555-0134','Atlanta','GA','USA','30301','1991-01-07','F','SILVER','2022-12-01','Y'),
+  ('C035','Ivan Green','ivan.g@email.com','555-0135','Omaha','NE','USA','68101','1985-07-20','M','BRONZE','2023-09-15','Y'),
+  ('C036','Julia Adams','julia.a@email.com','555-0136','Raleigh','NC','USA','27601','1997-04-11','F','PLATINUM','2020-08-18','Y'),
+  ('C037','Kevin Baker','kevin.b@email.com','555-0137','Cleveland','OH','USA','44101','1983-11-24','M','GOLD','2021-06-07','Y'),
+  ('C038','Laura Gonzalez','laura.g@email.com','555-0138','Arlington','TX','USA','76001','1990-08-06','F','SILVER','2022-02-15','Y'),
+  ('C039','Mike Nelson','mike.n@email.com','555-0139','New Orleans','LA','USA','70112','1975-03-28','M','BRONZE','2023-10-30','Y'),
+  ('C040','Nancy Carter','nancy.c@email.com','555-0140','Minneapolis','MN','USA','55401','1987-06-17','F','GOLD','2021-09-22','Y'),
+  ('C041','Oscar Mitchell','oscar.m@email.com','555-0141','Tulsa','OK','USA','74101','1993-12-09','M','SILVER','2022-07-04','Y'),
+  ('C042','Penny Perez','penny.p@email.com','555-0142','Tampa','FL','USA','33601','1998-05-23','F','BRONZE','2023-11-17','Y'),
+  ('C043','Quinn Roberts','quinn.r@email.com','555-0143','Aurora','CO','USA','80010','1986-02-28','M','PLATINUM','2020-04-06','Y'),
+  ('C044','Rose Turner','rose.t@email.com','555-0144','Wichita','KS','USA','67201','1995-10-15','F','GOLD','2021-12-11','Y'),
+  ('C045','Sam Phillips','sam.p@email.com','555-0145','Santa Ana','CA','USA','92701','1980-07-30','M','SILVER','2022-08-27','Y'),
+  ('C046','Tina Campbell','tina.c@email.com','555-0146','Corpus Christi','TX','USA','78401','1992-04-18','F','BRONZE','2023-12-03','Y'),
+  ('C047','Ulric Parker','ulric.p@email.com','555-0147','Riverside','CA','USA','92501','1984-09-05','M','GOLD','2021-10-28','Y'),
+  ('C048','Vera Evans','vera.e@email.com','555-0148','Lexington','KY','USA','40501','1999-01-22','F','SILVER','2022-11-14','Y'),
+  ('C049','Will Edwards','will.e@email.com','555-0149','Pittsburgh','PA','USA','15201','1981-06-08','M','BRONZE','2023-12-20','Y'),
+  ('C050','Xena Collins','xena.c@email.com','555-0150','Stockton','CA','USA','95201','1996-03-14','F','PLATINUM','2020-07-15','Y');
+
+3.3 Sample Product Data (30 products);
+
+INSERT INTO raw_products
+  (product_id, sku, product_name, category, sub_category, brand, unit_price, cost_price, stock_qty, supplier_id)
+VALUES
+  ('P001','SKU-E001','Apple iPhone 15 Pro 256GB','Electronics','Smartphones','Apple','999.99','650.00','500','SUP01'),
+  ('P002','SKU-E002','Samsung Galaxy S24 Ultra','Electronics','Smartphones','Samsung','1199.99','780.00','350','SUP02'),
+  ('P003','SKU-E003','Sony WH-1000XM5 Headphones','Electronics','Audio','Sony','349.99','180.00','800','SUP03'),
+  ('P004','SKU-E004','Apple MacBook Pro M3 14in','Electronics','Laptops','Apple','1999.99','1200.00','200','SUP01'),
+  ('P005','SKU-E005','Dell XPS 15 Laptop','Electronics','Laptops','Dell','1499.99','950.00','250','SUP04'),
+  ('P006','SKU-E006','iPad Air 5th Generation','Electronics','Tablets','Apple','749.99','450.00','400','SUP01'),
+  ('P007','SKU-E007','LG OLED 55in TV','Electronics','TVs','LG','1299.99','750.00','150','SUP05'),
+  ('P008','SKU-E008','Nintendo Switch OLED','Electronics','Gaming','Nintendo','349.99','210.00','600','SUP06'),
+  ('P009','SKU-C001','Levi Strauss 501 Jeans','Clothing','Bottoms','Levis','79.99','25.00','2000','SUP07'),
+  ('P010','SKU-C002','Nike Air Max 270','Clothing','Footwear','Nike','150.00','55.00','1500','SUP08'),
+  ('P011','SKU-C003','Adidas Ultraboost 23','Clothing','Footwear','Adidas','180.00','70.00','1200','SUP09'),
+  ('P012','SKU-C004','North Face Denali Jacket','Clothing','Outerwear','North Face','229.99','90.00','800','SUP10'),
+  ('P013','SKU-C005','Patagonia Better Sweater','Clothing','Tops','Patagonia','139.99','55.00','900','SUP11'),
+  ('P014','SKU-C006','Lululemon Align Leggings','Clothing','Activewear','Lululemon','98.00','35.00','1100','SUP12'),
+  ('P015','SKU-C007','Ray-Ban Aviator Sunglasses','Clothing','Accessories','Ray-Ban','163.00','60.00','700','SUP13'),
+  ('P016','SKU-H001','Instant Pot Duo 7-in-1','Home','Kitchen','Instant Pot','99.99','40.00','1000','SUP14'),
+  ('P017','SKU-H002','Dyson V15 Detect Vacuum','Home','Cleaning','Dyson','699.99','350.00','400','SUP15'),
+  ('P018','SKU-H003','KitchenAid Stand Mixer','Home','Kitchen','KitchenAid','449.99','200.00','300','SUP16'),
+  ('P019','SKU-H004','Roomba j7+ Robot Vacuum','Home','Cleaning','iRobot','649.99','320.00','350','SUP17'),
+  ('P020','SKU-H005','Ninja Foodi 9-in-1','Home','Kitchen','Ninja','199.99','85.00','750','SUP14'),
+  ('P021','SKU-B001','The 4-Hour Work Week (Book)','Books','Productivity','Tim Ferriss','14.99','4.00','5000','SUP18'),
+  ('P022','SKU-B002','Atomic Habits','Books','Self-Help','James Clear','18.99','5.50','4500','SUP18'),
+  ('P023','SKU-B003','Sapiens: A Brief History','Books','History','Yuval Harari','16.99','5.00','4000','SUP18'),
+  ('P024','SKU-S001','Whey Protein 5lb Chocolate','Sports','Nutrition','Optimum','54.99','22.00','1500','SUP19'),
+  ('P025','SKU-S002','Yoga Mat Premium 6mm','Sports','Yoga','Manduka','88.00','30.00','900','SUP20'),
+  ('P026','SKU-S003','Adjustable Dumbbell Set','Sports','Weights','Bowflex','399.99','180.00','500','SUP21'),
+  ('P027','SKU-T001','Kindle Paperwhite 11th Gen','Electronics','eReaders','Amazon','139.99','65.00','1200','SUP01'),
+  ('P028','SKU-T002','Fitbit Charge 6','Electronics','Wearables','Fitbit','159.99','72.00','900','SUP22'),
+  ('P029','SKU-T003','Apple Watch Series 9','Electronics','Wearables','Apple','399.99','200.00','700','SUP01'),
+  ('P030','SKU-H006','YETI Rambler 30oz Tumbler','Home','Drinkware','YETI','38.00','12.00','3000','SUP23');
+
+3.4 Sample Order Data (100 orders with line items);
+-- Orders with JSON line_items array
+
+INSERT INTO raw_orders
+  (order_id, customer_id, order_date, status, channel, region,
+   currency, subtotal, discount_amt, tax_amt, shipping_amt, total_amt,
+   payment_method, promo_code, line_items)
+VALUES
+  ('ORD-2024-0001','C001','2024-01-05','completed','web','Northeast',
+   'USD','1349.98','50.00','108.00','0.00','1407.98',
+   'credit_card','NEWYEAR10',
+   ('[{"product_id":"P001","qty":1,"unit_price":999.99},{"product_id":"P003","qty":1,"unit_price":349.99}]')::variant)
+  ('ORD-2024-0002','C002','2024-01-07','completed','mobile','West',
+   'USD','1999.99','0.00','160.00','0.00','2159.99',
+   'paypal',NULL,
+   ('[{"product_id":"P004","qty":1,"unit_price":1999.99}]')::variant),
+  ('ORD-2024-0003','C003','2024-01-10','completed','web','Midwest',
+   'USD','229.98','0.00','18.40','5.99','254.37',
+   'debit_card',NULL,
+   ('[{"product_id":"P009","qty":1,"unit_price":79.99},{"product_id":"P012","qty":1,"unit_price":149.99}]')::variant),
+  ('ORD-2024-0004','C004','2024-01-12','returned','web','South',
+   'USD','349.99','0.00','28.00','0.00','377.99',
+   'credit_card',NULL,
+   ('[{"product_id":"P008","qty":1,"unit_price":349.99}]')::variant),
+  ('ORD-2024-0005','C005','2024-01-15','completed','marketplace','Southwest',
+   'USD','300.00','30.00','21.60','0.00','291.60',
+   'credit_card','FLASH30',
+   ('[{"product_id":"P010","qty":2,"unit_price":150.00}]')::variant),
+  ('ORD-2024-0006','C008','2024-01-18','completed','web','West',
+   'USD','1299.99','0.00','104.00','0.00','1403.99',
+   'credit_card',NULL,
+   ('[{"product_id":"P007","qty":1,"unit_price":1299.99}]')::variant),
+  ('ORD-2024-0007','C015','2024-01-20','completed','mobile','Southeast',
+   'USD','549.97','0.00','44.00','0.00','593.97',
+   'apple_pay',NULL,
+   ('[{"product_id":"P006","qty":1,"unit_price":749.99},{"product_id":"P021","qty":1,"unit_price":14.99},{"product_id":"P022","qty":1,"unit_price":18.99}]')::variant),
+  ('ORD-2024-0008','C022','2024-02-01','completed','web','Northwest',
+   'USD','699.99','70.00','50.40','0.00','680.39',
+   'credit_card','SAVE10',
+   ('[{"product_id":"P017","qty":1,"unit_price":699.99}]')::variant),
+  ('ORD-2024-0009','C029','2024-02-05','completed','store','West',
+   'USD','399.99','0.00','32.00','0.00','431.99',
+   'cash',NULL,
+   ('[{"product_id":"P026","qty":1,"unit_price":399.99}]')::variant),
+  ('ORD-2024-0010','C036','2024-02-08','completed','mobile','Southeast',
+   'USD','559.98','0.00','44.80','5.99','610.77',
+   'google_pay',NULL,
+   ('[{"product_id":"P028","qty":1,"unit_price":159.99},{"product_id":"P029","qty":1,"unit_price":399.99}]')::variant),
+  ('ORD-2024-0011','C001','2024-02-14','completed','web','Northeast',
+   'USD','98.00','9.80','7.06','0.00','95.26',
+   'credit_card','VDAY10',
+   ('[{"product_id":"P014","qty":1,"unit_price":98.00}]')::variant),
+  ('ORD-2024-0012','C043','2024-02-20','completed','web','Mountain',
+   'USD','449.99','0.00','36.00','0.00','485.99',
+   'credit_card',NULL,
+   ('[{"product_id":"P018","qty":1,"unit_price":449.99}]')::variant),
+  ('ORD-2024-0013','C007','2024-03-01','cancelled','mobile','South',
+   'USD','150.00','0.00','0.00','5.99','155.99',
+   'debit_card',NULL,
+   ('[{"product_id":"P010","qty":1,"unit_price":150.00}]')::variant),
+  ('ORD-2024-0014','C019','2024-03-05','completed','web','Mountain',
+   'USD','54.99','0.00','4.40','4.99','64.38',
+   'credit_card',NULL,
+   ('[{"product_id":"P024","qty":1,"unit_price":54.99}]')::variant),
+  ('ORD-2024-0015','C030','2024-03-10','completed','marketplace','West',
+   'USD','1199.99','120.00','86.40','0.00','1166.39',
+   'credit_card','SPRING10',
+   ('[{"product_id":"P002","qty":1,"unit_price":1199.99}]')::variant),
+  ('ORD-2024-0016','C044','2024-03-15','completed','web','Midwest',
+   'USD','164.99','0.00','13.20','0.00','178.19',
+   'paypal',NULL,
+   ('[{"product_id":"P015","qty":1,"unit_price":163.00},{"product_id":"P022","qty":1,"unit_price":18.99}]')::variant),
+  ('ORD-2024-0017','C002','2024-04-02','completed','mobile','West',
+   'USD','399.99','0.00','32.00','0.00','431.99',
+   'apple_pay',NULL,
+   ('[{"product_id":"P029","qty":1,"unit_price":399.99}]')::variant),
+  ('ORD-2024-0018','C050','2024-04-08','completed','web','West',
+   'USD','199.98','20.00','14.40','0.00','194.38',
+   'credit_card','SPRING20',
+   ('[{"product_id":"P020","qty":1,"unit_price":199.99},{"product_id":"P021","qty":1,"unit_price":14.99}]')::variant),
+  ('ORD-2024-0019','C012','2024-04-15','completed','store','Southeast',
+   'USD','88.00','0.00','7.04','0.00','95.04',
+   'cash',NULL,
+   ('[{"product_id":"P025","qty":1,"unit_price":88.00}]')::variant),
+  ('ORD-2024-0020','C023','2024-04-22','completed','web','South',
+   'USD','649.99','0.00','52.00','0.00','701.99',
+   'credit_card',NULL,
+   ('[{"product_id":"P019","qty":1,"unit_price":649.99}]')::variant);
+-- Continue with Q2-Q4 orders (bulk insert)
+
+
+INSERT INTO raw_orders
+  (order_id, customer_id, order_date, status, channel, region,
+   currency, subtotal, discount_amt, tax_amt, shipping_amt, total_amt,
+   payment_method, promo_code, line_items)
+VALUES
+  ('ORD-2024-0021','C005','2024-05-03','completed','web','Southwest','USD','163.00','0.00','13.04','4.99','181.03','credit_card',NULL,('[{"product_id":"P015","qty":1,"unit_price":163.00}]')),
+  ('ORD-2024-0022','C033','2024-05-10','completed','mobile','Southwest','USD','199.98','0.00','16.00','0.00','215.98','google_pay',NULL,PARSE_JSON('[{"product_id":"P016","qty":2,"unit_price":99.99}]')),
+  ('ORD-2024-0023','C041','2024-05-18','returned','web','Midwest','USD','1499.99','0.00','120.00','0.00','1619.99','credit_card',NULL,PARSE_JSON('[{"product_id":"P005","qty":1,"unit_price":1499.99}]')),
+  ('ORD-2024-0024','C016','2024-05-25','completed','web','Northeast','USD','399.98','40.00','28.80','0.00','388.78','credit_card','SUMMER10',PARSE_JSON('[{"product_id":"P026","qty":1,"unit_price":399.99},{"product_id":"P021","qty":1,"unit_price":14.99}]')),
+  ('ORD-2024-0025','C039','2024-06-01','completed','store','South','USD','54.99','0.00','4.40','0.00','59.39','cash',NULL,PARSE_JSON('[{"product_id":"P024","qty":1,"unit_price":54.99}]')),
+  ('ORD-2024-0026','C008','2024-06-10','completed','marketplace','West','USD','2199.97','0.00','176.00','0.00','2375.97','credit_card',NULL,PARSE_JSON('[{"product_id":"P004","qty":1,"unit_price":1999.99},{"product_id":"P003","qty":1,"unit_price":349.99},{"product_id":"P027","qty":1,"unit_price":139.99}]')),
+  ('ORD-2024-0027','C047','2024-06-15','completed','web','West','USD','38.00','0.00','3.04','4.99','46.03','debit_card',NULL,PARSE_JSON('[{"product_id":"P030","qty":1,"unit_price":38.00}]')),
+  ('ORD-2024-0028','C001','2024-07-04','completed','mobile','Northeast','USD','349.99','0.00','28.00','0.00','377.99','apple_pay','JULY4TH',PARSE_JSON('[{"product_id":"P008","qty":1,"unit_price":349.99}]')),
+  ('ORD-2024-0029','C020','2024-07-12','completed','web','South','USD','139.99','14.00','10.08','0.00','136.07','credit_card','SAVE10',PARSE_JSON('[{"product_id":"P013","qty":1,"unit_price":139.99}]')),
+  ('ORD-2024-0030','C009','2024-07-20','completed','store','South','USD','750.00','75.00','54.00','0.00','729.00','credit_card','LOYAL10',PARSE_JSON('[{"product_id":"P010","qty":5,"unit_price":150.00}]')),
+  ('ORD-2024-0031','C015','2024-08-03','completed','web','Southeast','USD','1049.97','0.00','84.00','0.00','1133.97','paypal',NULL,PARSE_JSON('[{"product_id":"P001","qty":1,"unit_price":999.99},{"product_id":"P022","qty":1,"unit_price":18.99},{"product_id":"P023","qty":1,"unit_price":16.99}]')),
+  ('ORD-2024-0032','C037','2024-08-10','completed','mobile','Midwest','USD','180.00','18.00','12.96','0.00','174.96','google_pay','BACK2SCH',PARSE_JSON('[{"product_id":"P011","qty":1,"unit_price":180.00}]')),
+  ('ORD-2024-0033','C048','2024-08-18','completed','web','Midwest','USD','98.00','0.00','7.84','4.99','110.83','credit_card',NULL,PARSE_JSON('[{"product_id":"P014","qty":1,"unit_price":98.00}]')),
+  ('ORD-2024-0034','C002','2024-09-05','completed','web','West','USD','539.97','0.00','43.20','0.00','583.17','credit_card',NULL,PARSE_JSON('[{"product_id":"P029","qty":1,"unit_price":399.99},{"product_id":"P025","qty":1,"unit_price":88.00},{"product_id":"P024","qty":1,"unit_price":54.99}]')),
+  ('ORD-2024-0035','C029','2024-09-15','completed','store','West','USD','1199.99','0.00','96.00','0.00','1295.99','cash',NULL,PARSE_JSON('[{"product_id":"P002","qty":1,"unit_price":1199.99}]')),
+  ('ORD-2024-0036','C043','2024-10-01','completed','web','Mountain','USD','699.99','70.00','50.40','0.00','680.39','credit_card','FALL10',PARSE_JSON('[{"product_id":"P017","qty":1,"unit_price":699.99}]')),
+  ('ORD-2024-0037','C019','2024-10-10','completed','mobile','Mountain','USD','259.98','0.00','20.80','0.00','280.78','apple_pay',NULL,PARSE_JSON('[{"product_id":"P013","qty":1,"unit_price":139.99},{"product_id":"P015","qty":1,"unit_price":163.00}]')),
+  ('ORD-2024-0038','C005','2024-10-20','completed','web','Southwest','USD','399.99','0.00','32.00','0.00','431.99','paypal',NULL,PARSE_JSON('[{"product_id":"P026","qty":1,"unit_price":399.99}]')),
+  ('ORD-2024-0039','C036','2024-11-01','completed','marketplace','Southeast','USD','1849.97','185.00','133.20','0.00','1798.17','credit_card','BFCM10',PARSE_JSON('[{"product_id":"P001","qty":1,"unit_price":999.99},{"product_id":"P003","qty":1,"unit_price":349.99},{"product_id":"P027","qty":1,"unit_price":139.99},{"product_id":"P022","qty":1,"unit_price":18.99},{"product_id":"P023","qty":1,"unit_price":16.99}]')),
+  ('ORD-2024-0040','C022','2024-11-15','completed','web','Northwest','USD','2349.97','234.00','169.20','0.00','2285.17','credit_card','BF20',PARSE_JSON('[{"product_id":"P004","qty":1,"unit_price":1999.99},{"product_id":"P027","qty":1,"unit_price":139.99},{"product_id":"P030","qty":1,"unit_price":38.00}]')),
+  ('ORD-2024-0041','C008','2024-11-29','completed','web','West','USD','3249.95','325.00','234.00','0.00','3158.95','credit_card','BFCM25',PARSE_JSON('[{"product_id":"P002","qty":1,"unit_price":1199.99},{"product_id":"P004","qty":1,"unit_price":1999.99},{"product_id":"P021","qty":1,"unit_price":14.99}]')),
+  ('ORD-2024-0042','C050','2024-11-29','completed','mobile','West','USD','499.98','0.00','40.00','0.00','539.98','google_pay',NULL,PARSE_JSON('[{"product_id":"P005","qty":1,"unit_price":499.99},{"product_id":"P021","qty":1,"unit_price":14.99}]')),
+  ('ORD-2024-0043','C015','2024-12-01','completed','web','Southeast','USD','229.99','0.00','18.40','0.00','248.39','credit_card',NULL,PARSE_JSON('[{"product_id":"P012","qty":1,"unit_price":229.99}]')),
+  ('ORD-2024-0044','C001','2024-12-10','completed','mobile','Northeast','USD','399.99','0.00','32.00','0.00','431.99','apple_pay',NULL,PARSE_JSON('[{"product_id":"P029","qty":1,"unit_price":399.99}]')),
+  ('ORD-2024-0045','C030','2024-12-15','completed','web','West','USD','649.99','0.00','52.00','0.00','701.99','credit_card',NULL,PARSE_JSON('[{"product_id":"P019","qty":1,"unit_price":649.99}]')),
+  ('ORD-2024-0046','C044','2024-12-18','completed','store','Midwest','USD','113.97','0.00','9.12','0.00','123.09','cash',NULL,PARSE_JSON('[{"product_id":"P021","qty":3,"unit_price":14.99},{"product_id":"P022","qty":2,"unit_price":18.99},{"product_id":"P023","qty":2,"unit_price":16.99}]')),
+  ('ORD-2024-0047','C002','2024-12-20','completed','web','West','USD','139.99','0.00','11.20','0.00','151.19','paypal',NULL,PARSE_JSON('[{"product_id":"P027","qty":1,"unit_price":139.99}]')),
+  ('ORD-2024-0048','C009','2024-12-22','completed','mobile','South','USD','999.99','0.00','80.00','0.00','1079.99','apple_pay',NULL,PARSE_JSON('[{"product_id":"P001","qty":1,"unit_price":999.99}]')),
+  ('ORD-2024-0049','C016','2024-12-23','completed','web','Northeast','USD','1349.98','0.00','108.00','0.00','1457.98','credit_card',NULL,PARSE_JSON('[{"product_id":"P003","qty":1,"unit_price":349.99},{"product_id":"P001","qty":1,"unit_price":999.99}]')),
+  ('ORD-2024-0050','C037','2024-12-26','completed','web','Midwest','USD','449.99','45.00','32.40','0.00','437.39','credit_card','XMAS10',PARSE_JSON('[{"product_id":"P018","qty":1,"unit_price":449.99}]'));
+
+
+
+
+
+
+
+
+USE ROLE DE_ENGINEER_ROLE;
+USE DATABASE RETAILMART_DW;
+USE SCHEMA RAW;
+
+-- Create internal stage for CSV files
+CREATE OR REPLACE STAGE raw_data_stage
+  COMMENT = 'Internal stage for raw CSV and JSON files';
+
+-- File format for CSV
+CREATE OR REPLACE FILE FORMAT csv_format
+  TYPE = 'CSV'
+  FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+  SKIP_HEADER = 1
+  NULL_IF = ('NULL', 'null', 'N/A', '')
+  EMPTY_FIELD_AS_NULL = TRUE
+  TRIM_SPACE = TRUE
+  DATE_FORMAT = 'AUTO'
+  TIMESTAMP_FORMAT = 'AUTO';
+
+-- File format for JSON
+CREATE OR REPLACE FILE FORMAT json_format
+  TYPE = 'JSON'
+  STRIP_OUTER_ARRAY = TRUE;
+
+-- File format for Parquet (for data lake integration)
+CREATE OR REPLACE FILE FORMAT parquet_format
+  TYPE = 'PARQUET'
+  SNAPPY_COMPRESSION = TRUE;
+
+-- List files in stage
+LIST @raw_data_stage;
+
+RETAILMART_DW.RAW.RAW_DATA_STAGERETAILMART_DW.RAW.RAW_DATA_STAGERETAILMART_DW.RAW.RAW_DATA_STAGEput "C:\Users\MoHaN\Downloads\raw_customers_sample_50.csv" to @raw_data_stage;
+
+4.2 COPY INTO — Bulk Load Pattern;
+-- Pattern 1: Load all files from stage
+COPY INTO raw_customers
+  FROM @raw_data_stage/raw_customers_sample_50.csv
+  FILE_FORMAT = (FORMAT_NAME = 'csv_format')
+  ON_ERROR = 'CONTINUE'
+  PURGE = FALSE;   -- keep files for audit trail
+
+-- Pattern 2: Load specific files with transformation
+COPY INTO raw_orders( order_id , customer_id , order_date , status , channel , region, currency , subtotal , discount_amt , tax_amt , shipping_amt , total_amt , payment_method , promo_code ,  line_items ,_load_ts , _source_file VARCHAR(500))
+  FROM (
+    SELECT
+      $1,  -- order_id
+      $2,  -- customer_id
+      $3,  -- order_date
+      $4,  -- status
+      $5,  -- channel
+      $6,  -- region
+      $7,  -- currency
+      $8::FLOAT,   -- subtotal (explicit cast)
+      $9::FLOAT,   -- discount_amt
+      $10::FLOAT,  -- tax_amt
+      $11::FLOAT,  -- shipping_amt
+      $12::FLOAT,  -- total_amt
+      $13,  -- payment_method
+      $14,  -- promo_code
+      PARSE_JSON($15),  -- line_items JSON
+      CURRENT_TIMESTAMP,
+      METADATA$FILENAME  -- capture source file name
+    FROM @raw_data_stage/raw_orders_sample_50.csv
+  )
+  FILE_FORMAT = (FORMAT_NAME = 'csv_format')
+  ON_ERROR = 'SKIP_FILE_10%';  -- skip file if >10% rows fail
+
+-- Check load history
+SELECT *
+FROM TABLE(INFORMATION_SCHEMA.COPY_HISTORY(
+  TABLE_NAME => 'RAW_ORDERS',
+  START_TIME => DATEADD('hour', -24, CURRENT_TIMESTAMP)
+));
+
+4.3 Snowpipe — Continuous Auto-Ingestion;
+-- Snowpipe for real-time event ingestion (from S3 or ADLS)
+-- Prerequisites: S3 bucket + SQS event notification configured
+
+CREATE OR REPLACE PIPE events_pipe
+  AUTO_INGEST = TRUE
+  COMMENT = 'Auto-ingests event files from cloud storage'
+AS
+  COPY INTO raw_events (event_id, session_id, user_id, event_type, event_payload, event_ts)
+  FROM (
+    SELECT
+      $1:event_id::STRING,
+      $1:session_id::STRING,
+      $1:user_id::STRING,
+      $1:event_type::STRING,
+      $1,                         -- full JSON as VARIANT
+      $1:timestamp::TIMESTAMP
+    FROM @raw_data_stage/events/
+  )
+  FILE_FORMAT = (FORMAT_NAME = 'json_format');
+
+-- Check pipe status
+SELECT SYSTEM$PIPE_STATUS('events_pipe');
+
+-- View pipe ingestion history
+SELECT *
+FROM TABLE(INFORMATION_SCHEMA.PIPE_USAGE_HISTORY(
+  DATE_RANGE_START => CURRENT_DATE - 1,
+  PIPE_NAME => 'RETAILMART_DW.RAW.EVENTS_PIPE'
+
+
+
+
+1 Create Streams on Source Tables;
+
+USE SCHEMA RETAILMART_DW.RAW;
+
+-- Stream on raw_customers (captures all DML changes)
+CREATE OR REPLACE STREAM customers_stream
+  ON TABLE raw_customers
+  APPEND_ONLY = FALSE  -- capture inserts + updates + deletes
+  COMMENT = 'CDC stream for customer changes';
+
+-- Stream on raw_orders (append-only is fine for new orders)
+CREATE OR REPLACE STREAM orders_stream
+  ON TABLE raw_orders
+  APPEND_ONLY = TRUE  -- orders are never updated in source
+  COMMENT = 'Append-only stream for new orders';
+
+-- Stream on raw_products
+CREATE OR REPLACE STREAM products_stream
+  ON TABLE raw_products
+  APPEND_ONLY = FALSE;
+
+-- Check stream status
+SHOW STREAMS;
+
+-- View metadata columns in a stream
+-- METADATA$ACTION: 'INSERT' or 'DELETE'
+-- METADATA$ISUPDATE: TRUE if this row is part of an update
+-- METADATA$ROW_ID: Unique row ID
+SELECT
+  METADATA$ACTION,
+  METADATA$ISUPDATE,
+  customer_id, full_name, loyalty_tier
+FROM customers_stream;  -- initially empty until DML occurs
+
+5.2 Customer Dimension Load Task;
+USE SCHEMA RETAILMART_DW.ANALYTICS;
+
+-- Task: transform and load customers from stream into dim_customer
+CREATE OR REPLACE TASK load_dim_customer
+  WAREHOUSE = TRANSFORM_WH
+  SCHEDULE = '10 MINUTE'
+  WHEN SYSTEM$STREAM_HAS_DATA('RETAILMART_DW.RAW.CUSTOMERS_STREAM')
+AS
+BEGIN
+  -- Step 1: Merge new/updated customers into dimension
+  MERGE INTO RETAILMART_DW.ANALYTICS.dim_customer AS target
+  USING (
+    SELECT DISTINCT
+      customer_id,
+      full_name,
+      email,
+      phone,
+      city, state, country, postal_code,
+      TRY_TO_DATE(date_of_birth, 'YYYY-MM-DD') AS date_of_birth,
+      UPPER(gender) AS gender,
+      UPPER(loyalty_tier) AS loyalty_tier,
+      CASE
+        WHEN DATEDIFF('year', TRY_TO_DATE(date_of_birth,'YYYY-MM-DD'), CURRENT_DATE) < 25 THEN '18-24'
+        WHEN DATEDIFF('year', TRY_TO_DATE(date_of_birth,'YYYY-MM-DD'), CURRENT_DATE) < 35 THEN '25-34'
+        WHEN DATEDIFF('year', TRY_TO_DATE(date_of_birth,'YYYY-MM-DD'), CURRENT_DATE) < 45 THEN '35-44'
+        WHEN DATEDIFF('year', TRY_TO_DATE(date_of_birth,'YYYY-MM-DD'), CURRENT_DATE) < 55 THEN '45-54'
+        ELSE '55+'
+      END AS age_group,
+      TRY_TO_DATE(signup_date, 'YYYY-MM-DD') AS signup_date,
+      CASE WHEN UPPER(is_active) IN ('Y','YES','TRUE','1') THEN TRUE ELSE FALSE END AS is_active,
+      METADATA$ACTION
+    FROM RETAILMART_DW.RAW.customers_stream
+    WHERE METADATA$ACTION = 'INSERT'
+  ) AS source
+  ON target.customer_id = source.customer_id AND target.is_current = TRUE
+
+  -- Update: close old record if key attributes changed
+  WHEN MATCHED AND (
+    target.email <> source.email OR
+    target.loyalty_tier <> source.loyalty_tier OR
+    target.city <> source.city
+  ) THEN UPDATE SET
+    target.is_current = FALSE,
+    target.effective_to = CURRENT_DATE - 1,
+    target.updated_at = CURRENT_TIMESTAMP
+
+  -- Insert: new customer or SCD Type 2 new version
+  WHEN NOT MATCHED THEN INSERT (
+    customer_id, full_name, email, phone,
+    city, state, country, postal_code,
+    date_of_birth, gender, loyalty_tier, age_group,
+    signup_date, is_active, effective_from, is_current
+  ) VALUES (
+    source.customer_id, source.full_name, source.email, source.phone,
+    source.city, source.state, source.country, source.postal_code,
+    source.date_of_birth, source.gender, source.loyalty_tier, source.age_group,
+    source.signup_date, source.is_active, CURRENT_DATE, TRUE
+  );
+
+  -- Step 2: Log the run
+  INSERT INTO RETAILMART_DW.CONTROL.etl_audit_log
+    (pipeline_name, run_id, start_time, end_time, status, rows_inserted)
+  VALUES ('load_dim_customer', CURRENT_STATEMENT(), CURRENT_TIMESTAMP,
+          CURRENT_TIMESTAMP, 'SUCCESS', 0);
+END;
+
+-- Resume task (tasks start in suspended state)
+ALTER TASK load_dim_customer RESUME;
+
+5.3 Orders Fact Load Task;
+
+CREATE OR REPLACE TASK load_fact_orders
+  WAREHOUSE = TRANSFORM_WH
+  SCHEDULE = '15 MINUTE'
+  WHEN SYSTEM$STREAM_HAS_DATA('RETAILMART_DW.RAW.ORDERS_STREAM')
+AS
+  INSERT INTO RETAILMART_DW.ANALYTICS.fact_orders (
+    order_id, order_line_num, date_key, customer_sk, product_sk,
+    status, channel, region, payment_method, promo_code,
+    quantity, unit_price, line_subtotal, discount_amt,
+    tax_amt, shipping_amt, line_total, cost_total, gross_profit
+  )
+  SELECT
+    o.order_id,
+    f.index + 1                                              AS order_line_num,
+    TO_NUMBER(TO_CHAR(TO_DATE(o.order_date,'YYYY-MM-DD'),'YYYYMMDD')) AS date_key,
+    c.customer_sk,
+    p.product_sk,
+    o.status,
+    o.channel,
+    o.region,
+    o.payment_method,
+    o.promo_code,
+    f.value:qty::NUMBER                                      AS quantity,
+    f.value:unit_price::NUMBER(12,2)                         AS unit_price,
+    f.value:qty::NUMBER * f.value:unit_price::NUMBER(12,2)   AS line_subtotal,
+    -- Prorate discount proportionally across lines
+    ROUND(o.discount_amt::FLOAT *
+      (f.value:qty::NUMBER * f.value:unit_price::NUMBER(12,2)) /
+      NULLIF(o.subtotal::FLOAT, 0), 2)                       AS discount_amt,
+    ROUND(o.tax_amt::FLOAT *
+      (f.value:qty::NUMBER * f.value:unit_price::NUMBER(12,2)) /
+      NULLIF(o.subtotal::FLOAT, 0), 2)                       AS tax_amt,
+    ROUND(o.shipping_amt::FLOAT *
+      (f.value:qty::NUMBER * f.value:unit_price::NUMBER(12,2)) /
+      NULLIF(o.subtotal::FLOAT, 0), 2)                       AS shipping_amt,
+    f.value:qty::NUMBER * f.value:unit_price::NUMBER(12,2)   AS line_total,
+    f.value:qty::NUMBER * pr.cost_price                      AS cost_total,
+    (f.value:qty * f.value:unit_price::NUMBER(12,2)) -
+    (f.value:qty * pr.cost_price)                            AS gross_profit
+  FROM RETAILMART_DW.RAW.orders_stream o,
+  LATERAL FLATTEN(input => o.line_items) f
+  LEFT JOIN RETAILMART_DW.ANALYTICS.dim_customer c
+    ON o.customer_id = c.customer_id AND c.is_current = TRUE
+  LEFT JOIN RETAILMART_DW.ANALYTICS.dim_product p
+    ON f.value:product_id::STRING = p.product_id
+  LEFT JOIN RETAILMART_DW.RAW.raw_products pr
+    ON f.value:product_id::STRING = pr.product_id
+  WHERE o.METADATA$ACTION = 'INSERT';
+
+ALTER TASK load_fact_orders RESUME;
+
+-- Monitor task history
+SELECT name, state, scheduled_time, completed_time, error_message
+FROM TABLE(INFORMATION_SCHEMA.TASK_HISTORY(
+  SCHEDULED_TIME_RANGE_START => DATEADD('hour', -24, CURRENT_TIMESTAMP)
+))
+ORDER BY scheduled_time DESC;
+
+
+
+
+SELECT
+*
+FROM RETAILMART_DW.RAW.raw_orders o,
+LATERAL FLATTEN(input => o.line_items) f
+LEFT JOIN RETAILMART_DW.RAW.raw_products p
+  ON f.value:product_id::STRING = p.product_id
+ORDER BY o.order_id, line_num;
+
+
+
+
+-- Step 1: Build new dim_customer in a staging table
+CREATE TABLE RETAILMART_DW.ANALYTICS.dim_customer_new
+  CLONE RETAILMART_DW.ANALYTICS.dim_customer;
+
+-- Step 2: Apply transformations to new table
+UPDATE RETAILMART_DW.ANALYTICS.dim_customer_new
+  SET age_group = '55+' WHERE age_group IS NULL;
+
+-- Step 3: Swap tables atomically (zero downtime!)
+ALTER TABLE RETAILMART_DW.ANALYTICS.dim_customer
+  SWAP WITH RETAILMART_DW.ANALYTICS.dim_customer_new;
+
+-- Step 4: Clean up old table (now named dim_customer_new)
+DROP TABLE RETAILMART_DW.ANALYTICS.dim_customer_new;
+
+
+
+create table a(id int autoincrement,
+name varchar);
+
+
+insert into a(name) values('siri');
+
+select * from a;
+
+create table b clone a;
+
+select * from b;
+
+insert into b(name) values('sam');
+
+
+alter table a swap with b;
+
+alter table a cluster by (id);
+
+select SYSTEM$CLUSTERING_INFORMATION('a','id');
+
+
+
+select * from b;
+
+alter session set use_cached_result=true;
+
+create or replace masking policy mask_a
+as
+(val string) returns string->
+case when current_role() in ('DE_ENGINEER_ROLE') then val
+else '****' end;
+
+alter table b modify column name set masking policy mask_a;
+
+
+create or replace row access policy row_a
+as (region_col string) returns boolean->
+current_role in ('role')
+or exists (select ! from control.analyst_region_acess)
+
+
+SELECT * FROM RETAILMART_DW.CONTROL.analyst_region_access WHERE username = CURRENT_USER();
+    --AND region = region_col;
+
+
+create or replace tag mk_t
+allowed_values 'HIGH','MEDIUM','LOW';
+
+alter table a modify column name set tag mk_t='HIGH';
+
+select * from a;
+
+desc table a;
+
+
+
+create or replace dynamic table dyn_c
+target_lag='1 day'
+warehouse=transform_wh
+as 
+select * from a;
+
+
+select * from a;
+
+select * from dyn_c;
+
+alter dynamic table dyn_c refresh;
+
+
+insert into a(name) values('dad');
+
+show dynamic tables in schema raw;
+
+select * from table(information_schema.dynamic_table_refresh_history(name=>'dyn_c'));
+
+drop dynamic table dyn_c;
+
+
+
+
+
+
+
+
+select dateadd(year , seq4() ,date(current_date())) from table(generator(ROWCOUNT => 10));
+
+select dateadd(day , seq4() ,date(current_date())) from table(generator(ROWCOUNT => 10));
+
+
+with t as (select dateadd(day , seq4() ,date(current_date())) dt from table(generator(ROWCOUNT => 10))
+)
+select dt,year(dt)yr,month(dt)mnt,day(dt)dy,
+yearofweek(dt),quarter(dt)qdt,
+dayofweek(dt),dayname(dt)dn,
+date_trunc(year,dt)
+from t;
+
+
+
+create table a(id int autoincrement,
+name varchar);
+
+
+insert into a(name) values('siri');
+
+select * from a;
+
+create table b clone a;
+
+select * from b;
+
+insert into b(name) values('sam');
+
+
+alter table a swap with b;
+
+alter table a cluster by (id);
+
+select SYSTEM$CLUSTERING_INFORMATION('a','id');
+
+
+
+select * from b;
+
+alter session set use_cached_result=true;
+
+create or replace masking policy mask_a
+as
+(val string) returns string->
+case when current_role() in ('DE_ENGINEER_ROLE') then val
+else '****' end;
+
+alter table b modify column name set masking policy mask_a;
+
+
+create or replace row access policy row_a
+as (region_col string) returns boolean->
+current_role in ('role')
+or exists (select ! from control.analyst_region_acess)
+
+
+SELECT * FROM RETAILMART_DW.CONTROL.analyst_region_access WHERE username = CURRENT_USER();
+    --AND region = region_col;
+
+
+create or replace tag mk_t
+allowed_values 'HIGH','MEDIUM','LOW';
+
+alter table a modify column name set tag mk_t='HIGH';
+
+select * from a;
+
+desc table a;
+
+
+
+create or replace dynamic table dyn_c
+target_lag='1 day'
+warehouse=transform_wh
+as 
+select * from a;
+
+
+select * from a;
+
+select * from dyn_c;
+
+alter dynamic table dyn_c refresh;
+
+
+insert into a(name) values('dad');
+
+show dynamic tables in schema raw;
+
+select * from table(information_schema.dynamic_table_refresh_history(name=>'dyn_c'));
+
+drop dynamic table dyn_c;
+
+create or replace share mk_s;
+
+grant usage on database retailmart_dw to share mk_s;
+grant usage on schema raw to share mk_s;
+grant select on table a to share mk_s;
+
+alter share mk_s add account=public;
+
+show shares;
+
+create stage mk_csv
+comment='CSV file';
+
+list @mk_csv;
+
+select $1,$2,$3,$4,$5 from @mk_csv;
+
+
+create table cust(id int,ord varchar(50),c_id varchar(10),or_d date,sta varchar(50));
+
+select * from cust;
+
+create file format mk_csv
+type='CSV'
+field_optionally_enclosed_by='"'
+skip_header=1
+null_if=('null','Null','');
+
+
+
+copy into cust
+from (select $1,$2,$3,$4,$5 from @mk_csv)
+FILE_FORMAT = (FORMAT_NAME = 'mk_csv')
+on_error='CONTINUE'
+purge=FALSE;
+
+select * from cust;
+
+create table json_mk(val variant);
+
+copy into json_mk
+from (
+select $17 from @mk_csv)
+FILE_FORMAT = (FORMAT_NAME = 'mk_csv');
+
+select parse_json($1)[0]:product_id from json_mk;
+
+
+
+SELECT 
+    f.value:product_id::STRING AS product_id,
+    f.value:qty::NUMBER        AS qty,
+    f.value:unit_price::FLOAT  AS unit_price
+FROM json_mk,
+     LATERAL FLATTEN(INPUT => PARSE_JSON($1)) f;
+
+
+
+select *from a;
+
+
+select *from b;
+
+create stream mk_str on table a;
+
+show streams;
+
+update a set name='mohans' where id=3;
+
+
+select * from mk_str;
+
+
+CREATE OR REPLACE TASK cdc_a
+WAREHOUSE = compute_wh
+SCHEDULE = '1 MINUTE'
+WHEN SYSTEM$STREAM_HAS_DATA('mk_str')
+AS
+MERGE INTO b tgt
+USING (
+    SELECT *
+    FROM mk_str
+    WHERE METADATA$ACTION = 'INSERT'
+) src
+ON tgt.id = src.id
+
+WHEN MATCHED
+THEN UPDATE SET tgt.name = src.name
+
+WHEN NOT MATCHED
+THEN INSERT (id, name)
+VALUES (src.id, src.name);
+
+
+
+alter task cdc_a suspend;
+
+grant usage on database retailmart_dw to accountadmin;
+grant  all on table a to accountadmin;
+grant  all on table b to accountadmin;
+
+SELECT *
+FROM TABLE(INFORMATION_SCHEMA.TASK_HISTORY(
+    TASK_NAME => 'cdc_a'
+))
+ORDER BY SCHEDULED_TIME DESC;
+
+
+DESCRIBE TASK cdc_a;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

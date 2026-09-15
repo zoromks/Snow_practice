@@ -1,0 +1,19 @@
+name: ecommerce_mks
+version: 1.0.0
+config-version: 2
+profile: ecommerce_mks
+model-paths:
+  - models
+analysis-paths:
+  - analyses
+test-paths:
+  - tests
+seed-paths:
+  - seeds
+macro-paths:
+  - macros
+snapshot-paths:
+  - snapshots
+models:
+  ecommerce_mks:
+    +materialized: view

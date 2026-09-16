@@ -1,0 +1,11 @@
+student_id,student_name,gender,college_id,course,city,admission_year
+1001,Ravi Kumar,M,101,MPC,Hyderabad,2024
+1002,Anjali Reddy,F,102,BPC,Vijayawada,2024
+1003,Suresh Kumar,M,101,MEC,Warangal,2025
+1004,Priya Sharma,F,103,CEC,Guntur,2025
+1005,Arjun Rao,M,102,HEC,Hyderabad,2025
+1006,Divya Reddy,F,104,BPC,Visakhapatnam,2024
+1007,Kiran Kumar,M,103,MPC,Tirupati,2025
+1008,Sneha Rao,F,104,MEC,Hyderabad,2024
+1009,Rahul Verma,M,101,CEC,Warangal,2025
+1010,Pooja Reddy,F,102,MPC,Vijayawada,2024

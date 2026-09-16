@@ -1,0 +1,13 @@
+retail_analytics:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: UVOMEZD-JL20019
+      user: dbt_user
+      password: AAA@#mk0987654
+      role: dbt_role
+      database: retail_db
+      warehouse: dbt_wh
+      schema: dbt_dev
+      threads: 4

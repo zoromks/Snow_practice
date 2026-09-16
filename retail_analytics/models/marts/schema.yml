@@ -1,0 +1,40 @@
+version: 2
+
+models:
+  - name: dim_customers
+    description: "One row per customer with lifetime order metrics."
+    columns:
+      - name: customer_id
+        description: "Primary key"
+        tests:
+          - unique
+          - not_null
+      - name: email
+        tests:
+          - not_null
+
+  - name: dim_products
+    description: "One row per product."
+    columns:
+      - name: product_id
+        tests:
+          - unique
+          - not_null
+
+  - name: fct_orders
+    description: "One row per order with computed totals and margin."
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+      - name: customer_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_customers')
+              field: customer_id
+      - name: status
+        tests:
+          - accepted_values:
+              values: ['completed', 'cancelled', 'pending']

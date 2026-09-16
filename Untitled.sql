@@ -17,4 +17,4 @@ select * from fact_ords;
 
 
 
-
+SHOW EXTERNAL ACCESS INTEGRATIONS;

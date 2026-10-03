@@ -1,0 +1,11 @@
+SELECT
+    ORDER_ID,
+    CUSTOMER_ID,
+    PRODUCT_ID,
+    ORDER_DATE,
+    QUANTITY,
+    ORDER_STATUS
+
+FROM {{ source('raw', 'orders') }}
+
+WHERE ORDER_STATUS = 'COMPLETED'

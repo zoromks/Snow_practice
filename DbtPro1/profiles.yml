@@ -1,0 +1,15 @@
+DbtPro1:
+  target: dev
+
+  outputs:
+
+    dev:
+      type: snowflake
+      account: RHUUXMP-YC74146
+      user: MOHANKS
+      password: AAA@#mk0987654
+      role: ACCOUNTADMIN
+      database: DBT_RETAIL
+      warehouse: COMPUTE_WH
+      schema: ANALYTICS
+      threads: 4

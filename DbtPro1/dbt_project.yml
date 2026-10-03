@@ -1,0 +1,23 @@
+name: DbtPro1
+
+version: '1.0.0'
+
+profile: 'DbtPro1'
+
+model-paths: ["models"]
+
+target-path: "target"
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+
+  DbtPro1:
+
+    staging:
+      +materialized: view
+
+    marts:
+      +materialized: table

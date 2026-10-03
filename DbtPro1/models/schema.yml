@@ -1,0 +1,51 @@
+version: 2
+
+models:
+
+  - name: stg_customers
+
+    columns:
+
+      - name: CUSTOMER_ID
+        tests:
+          - not_null
+          - unique
+
+  - name: stg_products
+
+    columns:
+
+      - name: PRODUCT_ID
+        tests:
+          - not_null
+          - unique
+
+  - name: stg_orders
+
+    columns:
+
+      - name: ORDER_ID
+        tests:
+          - not_null
+          - unique
+
+      - name: CUSTOMER_ID
+        tests:
+          - not_null
+
+      - name: PRODUCT_ID
+        tests:
+          - not_null
+
+  - name: fct_orders
+
+    columns:
+
+      - name: ORDER_ID
+        tests:
+          - not_null
+          - unique
+
+      - name: TOTAL_AMOUNT
+        tests:
+          - not_null

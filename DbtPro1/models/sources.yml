@@ -13,3 +13,13 @@ sources:
       - name: products
 
       - name: orders
+
+      - name: employee_details
+
+  - name: analytics
+    database: DBT_RETAIL
+    schema: analytics
+
+    tables:
+
+      - name: emp
